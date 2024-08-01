@@ -1591,7 +1591,13 @@ static int omap8250_probe(struct platform_device *pdev)
 		return ret;
 
 	priv->wakeirq = irq_of_parse_and_map(np, 1);
-
+	/*
+	 * If there is a dedicated wakeirq, that means that wakeups
+	 * via IO daisy chain are enabled at the pin/pad level, so the device
+	 * IP itself does not need to be flagged as a wakeup source.
+	 */
+	if (priv->wakeirq)
+		device_wakeup_disable(&pdev->dev);
 	ret = serial8250_register_8250_port(&up);
 	if (ret < 0) {
 		dev_err(&pdev->dev, "unable to register 8250 port\n");
