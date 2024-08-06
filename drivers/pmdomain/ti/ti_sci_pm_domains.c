@@ -13,6 +13,8 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/slab.h>
+#include <linux/pm_qos.h>
+#include <linux/pm_runtime.h>
 #include <linux/soc/ti/ti_sci_protocol.h>
 #include <dt-bindings/soc/ti,sci_pm_domain.h>
 
@@ -47,9 +49,75 @@ struct ti_sci_pm_domain {
 	struct generic_pm_domain pd;
 	struct list_head node;
 	struct ti_sci_genpd_provider *parent;
+	s32 lat_constraint;
+	bool constraint_sent;
+	bool wkup_constraint;
 };
 
 #define genpd_to_ti_sci_pd(gpd) container_of(gpd, struct ti_sci_pm_domain, pd)
+
+static inline bool ti_sci_pd_is_valid_constraint(s32 val)
+{
+	return val != PM_QOS_RESUME_LATENCY_NO_CONSTRAINT;
+}
+
+static int ti_sci_pd_send_constraint(struct device *dev, s32 val)
+{
+	struct generic_pm_domain *genpd = pd_to_genpd(dev->pm_domain);
+	struct ti_sci_pm_domain *pd = genpd_to_ti_sci_pd(genpd);
+	const struct ti_sci_handle *ti_sci = pd->parent->ti_sci;
+	int ret;
+
+	ret = ti_sci->ops.pm_ops.set_latency_constraint(ti_sci, val, TISCI_MSG_CONSTRAINT_SET);
+	if (!ret) {
+		pd->constraint_sent = true;
+		dev_dbg(dev, "ti_sci_pd: ID:%d set latency constraint %d\n",
+			pd->idx, val);
+	} else {
+		dev_err(dev, "ti_sci_pd: set latency constraint failed: ret=%d\n",
+			ret);
+	}
+
+	return ret;
+}
+
+static inline void ti_sci_pd_clear_constraints(struct device *dev)
+{
+	struct generic_pm_domain *genpd = pd_to_genpd(dev->pm_domain);
+	struct ti_sci_pm_domain *pd = genpd_to_ti_sci_pd(genpd);
+
+	pd->lat_constraint = PM_QOS_RESUME_LATENCY_NO_CONSTRAINT;
+	pd->constraint_sent = false;
+	pd->wkup_constraint = false;
+}
+
+static inline bool ti_sci_pd_check_wkup_constraint(struct device *dev)
+{
+	struct generic_pm_domain *genpd = pd_to_genpd(dev->pm_domain);
+	struct ti_sci_pm_domain *pd = genpd_to_ti_sci_pd(genpd);
+	const struct ti_sci_handle *ti_sci = pd->parent->ti_sci;
+	int ret;
+
+	if (device_may_wakeup(dev)) {
+		/*
+		 * If device can wakeup using IO daisy chain wakeups,
+		 * we do not want to set a constraint.
+		 */
+		if (dev->power.wakeirq) {
+			dev_dbg(dev, "%s: has wake IRQ, not setting constraints\n", __func__);
+			return false;
+		}
+
+		ret = ti_sci->ops.pm_ops.set_device_constraint(ti_sci, pd->idx,
+							       TISCI_MSG_CONSTRAINT_SET);
+		if (!ret) {
+			pd->wkup_constraint = true;
+			dev_dbg(dev, "ti_sci_pd: ID:%d set device constraint.\n", pd->idx);
+		}
+	}
+
+	return pd->wkup_constraint;
+}
 
 /*
  * ti_sci_pd_power_off(): genpd power down hook
@@ -59,6 +127,18 @@ static int ti_sci_pd_power_off(struct generic_pm_domain *domain)
 {
 	struct ti_sci_pm_domain *pd = genpd_to_ti_sci_pd(domain);
 	const struct ti_sci_handle *ti_sci = pd->parent->ti_sci;
+	struct pm_domain_data *pdd;
+
+	list_for_each_entry(pdd, &domain->dev_list, list_node) {
+		struct device *dev = pdd->dev;
+		s32 val;
+
+		/* If device has any resume latency constraints, send 'em */
+		val = dev_pm_qos_read_value(dev, DEV_PM_QOS_RESUME_LATENCY);
+		if (ti_sci_pd_is_valid_constraint(val) && !pd->constraint_sent)
+			ti_sci_pd_send_constraint(dev, val);
+		pd->lat_constraint = val;
+	}
 
 	return ti_sci->ops.dev_ops.put_device(ti_sci, pd->idx);
 }
@@ -77,6 +157,40 @@ static int ti_sci_pd_power_on(struct generic_pm_domain *domain)
 								pd->idx);
 	else
 		return ti_sci->ops.dev_ops.get_device(ti_sci, pd->idx);
+}
+
+static int ti_sci_pd_resume(struct device *dev)
+{
+	ti_sci_pd_clear_constraints(dev);
+	return pm_generic_resume(dev);
+}
+
+static int ti_sci_pd_suspend(struct device *dev)
+{
+	struct generic_pm_domain *genpd = pd_to_genpd(dev->pm_domain);
+	struct ti_sci_pm_domain *pd = genpd_to_ti_sci_pd(genpd);
+	s32 val;
+	int ret;
+
+	ret = pm_generic_suspend(dev);
+	if (ret)
+		return ret;
+
+	/* Check if device has any resume latency constraints */
+	val = dev_pm_qos_read_value(dev, DEV_PM_QOS_RESUME_LATENCY);
+	if (ti_sci_pd_is_valid_constraint(val) && !pd->constraint_sent) {
+		if (genpd && genpd->status == GENPD_STATE_OFF)
+			dev_warn(dev, "%s: %s: already off.\n", genpd->name, __func__);
+		else if (pm_runtime_suspended(dev))
+			dev_warn(dev, "%s: %s: already RPM suspended.\n", genpd->name, __func__);
+		else
+			ti_sci_pd_send_constraint(dev, val);
+	}
+	pd->lat_constraint = val;
+
+	ti_sci_pd_check_wkup_constraint(dev);
+
+	return 0;
 }
 
 /*
@@ -188,7 +302,15 @@ static int ti_sci_pm_domain_probe(struct platform_device *pdev)
 				pd->pd.power_on = ti_sci_pd_power_on;
 				pd->idx = args.args[0];
 				pd->parent = pd_provider;
-
+				pd->lat_constraint = PM_QOS_RESUME_LATENCY_NO_CONSTRAINT;
+				/*
+				 * If SCI constraint functions are present, then firmware
+				 * supports the constraints API.
+				 */
+				if (pd_provider->ti_sci->ops.pm_ops.set_device_constraint) {
+					pd->pd.domain.ops.resume = ti_sci_pd_resume;
+					pd->pd.domain.ops.suspend = ti_sci_pd_suspend;
+				}
 				pm_genpd_init(&pd->pd, NULL, true);
 
 				list_add(&pd->node, &pd_provider->pd_list);
