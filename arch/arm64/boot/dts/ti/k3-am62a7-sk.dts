@@ -641,7 +641,7 @@
 };
 
 &usbss0 {
-	status = "okay";
+	status = "disabled";
 	ti,vbus-divider;
 };
 
@@ -656,7 +656,7 @@
 };
 
 &usbss1 {
-	status = "okay";
+	status = "disabled";
 };
 
 &usb1 {
